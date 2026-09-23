@@ -523,14 +523,49 @@ namespace command
 			game::CL_ForwardCommandToServer(local_client_num, text.data());
 		}
 
+		// Scripts receive chat as: player waittill("s2x_chat", message, team_chat)
+		void notify_chat(const int client_num, const std::string& text, const bool team)
+		{
+			const auto player = get_mp_player(client_num);
+			if (!player || text.empty() || game::virtual_lobby_loaded())
+			{
+				return;
+			}
+
+			// Intern the event name only for this notify; a map unload may release all script strings.
+			// 0x6891F0 is SL_GetString and 0x68B4A0 is RemoveRefToValue.
+			const auto event = utils::hook::invoke<unsigned int>(0x6891F0_g, "s2x_chat", 0u);
+			game::Scr_AddInt(team ? 1 : 0);
+			game::Scr_AddString(text.data());
+			game::Scr_Notify(player.entity, event, 2);
+			utils::hook::invoke<void>(0x68B4A0_g, static_cast<int>(game::VAR_STRING), static_cast<std::uint64_t>(event));
+		}
+
 		void client_command_mp_stub(const int client_num)
 		{
 			const params_sv params{};
+
+			// Copy the chat text before the native handler runs: the arguments live in the engine's shared tokenizer state.
+			// The chat prompt starts its text with a 0x1F marker that the engine skips when printing; a console say has none.
+			const auto verb = utils::string::to_lower(params[0]);
+			const auto chat = verb == "say" || verb == "say_team";
+			const auto team = verb == "say_team";
+
+			auto text = chat ? params.join(1) : std::string{};
+			if (!text.empty() && text.front() == '\x1F')
+			{
+				text.erase(0, 1);
+			}
 
 			const auto handled = execute_custom_sv_command_internal(client_num, params);
 			if (!handled)
 			{
 				client_command_mp_hook.invoke<void>(client_num);
+
+				if (chat)
+				{
+					notify_chat(client_num, text, team);
+				}
 			}
 		}
 
