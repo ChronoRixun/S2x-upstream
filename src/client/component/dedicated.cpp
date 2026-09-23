@@ -798,6 +798,20 @@ namespace dedicated
 			game::Scr_AddInt(0);
 		}
 
+		int playlist_dvar_command()
+		{
+			// The playlist rules include "2806 0" when entering the lobby and after every
+			// match. Keep the config's bot_AutoConnectDefault: party startup copies it into
+			// the match settings that the stock bot script reads.
+			const auto* dvar = game::Dvar_FindMalleableVar(game::Cmd_Argv(0));
+			if (dvar && dvar == game::Dvar_FindMalleableVar("bot_AutoConnectDefault"))
+			{
+				return 1;
+			}
+
+			return game::Dvar_Command();
+		}
+
 		void queue_startup_config(const int local_client)
 		{
 			const auto config = utils::flags::get_plus_value("exec");
@@ -1245,6 +1259,12 @@ namespace dedicated
 			if (game::environment::is_multiplayer())
 			{
 				gsc::override_function("isusingmatchrulesdata", gscr_is_using_match_rules_data_stub);
+
+				// Dvar_Command calls in Playlist_RunRules (0x6563D0).
+				for (const auto address : {0x65665E_g, 0x656922_g, 0x656BB2_g, 0x656E52_g})
+				{
+					utils::hook::call(address, playlist_dvar_command);
+				}
 			}
 
 			scr_begin_load_scripts_hook.create(0x6856D0_g, scr_begin_load_scripts_stub);
