@@ -632,9 +632,31 @@ namespace command
 			game::CL_ForwardCommandToServer(local_client_num, text.data());
 		}
 
+		// Scripts receive player waittill("s2x_chat", message, team_chat).
+		void notify_chat(const int client_num, const std::string& text, const bool team)
+		{
+			if (text.empty() || !game::SV_Loaded() || game::virtual_lobby_loaded() ||
+				client_num < 0 || client_num >= *game::sv_maxclients) return;
+			auto* entities = game::mp::g_entities.get();
+			if (!entities || !entities[client_num].client) return;
+			// SL_GetString and RemoveRefToValue; release the event after this notify.
+			const auto event = utils::hook::invoke<unsigned>(0x6891F0_g, "s2x_chat", 0u);
+			game::Scr_AddInt(team ? 1 : 0);
+			game::Scr_AddString(text.c_str());
+			game::Scr_Notify(&entities[client_num], event, 2);
+			utils::hook::invoke<void>(0x68B4A0_g, static_cast<int>(game::VAR_STRING), static_cast<std::uint64_t>(event));
+		}
+
 		void client_command_mp_stub(const int client_num)
 		{
 			const params_sv params{};
+			// Own text before callbacks/native handlers can retokenize shared arguments.
+			const std::string_view verb{params[0]};
+			const auto chat = verb == "say" || verb == "say_team";
+			auto text = chat ? params.join(1) : std::string{};
+			if (!text.empty() && text.front() == '\x1F') text.erase(0, 1);
+			text = text.substr(0, 256);
+			const auto team = verb == "say_team";
 
 			for (const auto& callback : get_client_command_callbacks())
 			{
@@ -645,6 +667,7 @@ namespace command
 			if (!handled)
 			{
 				client_command_mp_hook.invoke<void>(client_num);
+				if (chat) notify_chat(client_num, text, team);
 			}
 		}
 
