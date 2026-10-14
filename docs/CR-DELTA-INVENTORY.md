@@ -276,3 +276,9 @@ A	tools/server-scripts/README.md
 A	tools/server-scripts/examples/scripting_api.gsc
 A	tools/server-status.ps1
 ```
+
+## Mod-loader integration boundaries
+
+The new loader mounts selected roots and restarts LUI; it does not construct CSV StringTable assets or repair Gun Game loadouts. Current upstream only recognises roots containing scripts or ui_scripts, so CSV-only mod-folder recognition is not supplied by the CSV proposal. Use normal loose paths or an otherwise valid selected mod. The override's mod-path cache keys protect lookup identity, not automatic replacement of engine-held table pointers.
+
+The Gun Game script can be delivered as a selected gameplay mod. Its mode/map guards do not resolve other scripts changing the same costumes/loadouts. Both proposal branches now carry these constraints and concrete enable/unload/reload/gameplay acceptance scenarios. They remain source/build-checked staging proposals pending native mod-manager runtime acceptance.
