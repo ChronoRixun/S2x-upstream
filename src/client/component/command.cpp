@@ -39,6 +39,12 @@ namespace command
 			return map;
 		}
 
+		std::vector<sv_command_param_function>& get_client_command_callbacks()
+		{
+			static std::vector<sv_command_param_function> callbacks{};
+			return callbacks;
+		}
+
 		struct mp_player_context
 		{
 			game::mp::client_t* session{};
@@ -393,6 +399,107 @@ namespace command
 			}
 		}
 
+		std::string escape_csv(const char* value)
+		{
+			const std::string_view text = value ? value : "";
+			if (text.find_first_of(",\"\r\n") == std::string_view::npos)
+			{
+				return std::string(text);
+			}
+
+			std::string result = "\"";
+			for (const auto c : text)
+			{
+				if (c == '"')
+				{
+					result.push_back('"');
+				}
+
+				result.push_back(c);
+			}
+
+			result.push_back('"');
+			return result;
+		}
+
+		void dump_string_tables(const params& arguments)
+		{
+			struct dump_context
+			{
+				std::string filter;
+				std::vector<std::pair<std::string, std::string>> tables;
+			};
+
+			dump_context context{arguments.size() >= 2 ? arguments[1] : ""};
+			// Copy asset contents while enumeration holds the database read lock.
+			game::DB_EnumXAssets_FastFile(game::ASSET_TYPE_STRINGTABLE, [](const game::XAssetHeader header, void* data)
+			{
+				auto& context = *static_cast<dump_context*>(data);
+				const auto* table = header.stringTable;
+				if (!table || !table->name || (!context.filter.empty()
+					&& !utils::string::match_compare(context.filter, table->name, false)))
+				{
+					return;
+				}
+
+				std::string buffer{};
+				for (auto row = 0; row < table->rowCount; ++row)
+				{
+					for (auto column = 0; column < table->columnCount; ++column)
+					{
+						if (column)
+						{
+							buffer.push_back(',');
+						}
+
+						buffer.append(escape_csv(table->values[row * table->columnCount + column].string));
+					}
+
+					buffer.append("\r\n");
+				}
+
+				context.tables.emplace_back(table->name, std::move(buffer));
+			}, &context, true);
+
+			for (const auto& [name, contents] : context.tables)
+			{
+				utils::io::write_file(std::format("s2x/dump/stringtables/{}", name), contents);
+			}
+
+			console::info("Dumped %zu stringtables to s2x/dump/stringtables\n", context.tables.size());
+		}
+
+		void dump_localization(const params& arguments)
+		{
+			struct dump_context
+			{
+				std::string filter;
+				std::string buffer;
+				int count{};
+			};
+
+			dump_context context{arguments.size() >= 2 ? arguments[1] : ""};
+			game::DB_EnumXAssets_FastFile(game::ASSET_TYPE_LOCALIZE, [](const game::XAssetHeader header, void* data)
+			{
+				auto& context = *static_cast<dump_context*>(data);
+				const auto* entry = header.localize;
+				if (!entry || !entry->name || (!context.filter.empty()
+					&& !utils::string::match_compare(context.filter, entry->name, false)))
+				{
+					return;
+				}
+
+				context.buffer.append(escape_csv(entry->name));
+				context.buffer.push_back(',');
+				context.buffer.append(escape_csv(entry->value));
+				context.buffer.append("\r\n");
+				++context.count;
+			}, &context, true);
+
+			utils::io::write_file("s2x/dump/localization.csv", context.buffer);
+			console::info("Dumped %i localized strings to s2x/dump/localization.csv\n", context.count);
+		}
+
 		void dump_commands(const params& arguments)
 		{
 			console::info("================================ COMMAND DUMP =====================================\n");
@@ -437,6 +544,8 @@ namespace command
 		{
 			command::add("listassetpool", list_asset_pool);
 			command::add("commandDump", dump_commands);
+			command::add("dumpStringtables", dump_string_tables);
+			command::add("dumpLocalization", dump_localization);
 		}
 
 		void add_sp_developer_commands()
@@ -526,6 +635,11 @@ namespace command
 		void client_command_mp_stub(const int client_num)
 		{
 			const params_sv params{};
+
+			for (const auto& callback : get_client_command_callbacks())
+			{
+				callback(client_num, params);
+			}
 
 			const auto handled = execute_custom_sv_command_internal(client_num, params);
 			if (!handled)
@@ -746,6 +860,11 @@ namespace command
 		}
 
 		add_server_raw(command.data());
+	}
+
+	void on_client_command(sv_command_param_function callback)
+	{
+		get_client_command_callbacks().push_back(std::move(callback));
 	}
 
 	struct component final : generic_component

@@ -2,6 +2,7 @@
 #include "loader/component_loader.hpp"
 
 #include "party.hpp"
+#include "custom_match.hpp"
 #include "dedicated_party.hpp"
 #include "dedicated_party_client.hpp"
 #include "command.hpp"
@@ -35,6 +36,11 @@ namespace party
 		utils::hook::detour cl_connect_hook;
 		utils::hook::detour disconnect_command_hook;
 		const game::dvar_t* change_team_enabled{};
+
+		bool party_join_is_blocked_by_zombies_wave_stub(const void*, const int)
+		{
+			return false;
+		}
 
 		bool can_change_assigned_team()
 		{
@@ -303,7 +309,7 @@ namespace party
 				&& game::PartySettings_GetRankedMatch(&party_data->settings) == 0;
 		}
 
-		bool is_s2x_map_match(game::PartyData* party_data)
+		bool is_client_map_match(game::PartyData* party_data)
 		{
 			return client_map_session_active && party_data
 				&& game::Party_GetPublicMatch(party_data) == 0
@@ -333,6 +339,11 @@ namespace party
 
 		int get_private_match_player_limit()
 		{
+			if (game::environment::is_multiplayer())
+			{
+				return custom_match::get_player_limit();
+			}
+
 			const auto& mode = game::environment::get_online_mode_info();
 			const auto* party_maxplayers = game::Dvar_FindMalleableVar("5321");
 			const auto configured_max = party_maxplayers
@@ -385,7 +396,7 @@ namespace party
 			if (game_lobby && game::Party_IsRunning(game_lobby)
 				&& (!game::Party_AreWeHost(game_lobby)
 					|| (!is_unranked_private_match(game_lobby)
-						&& !is_s2x_map_match(game_lobby))))
+						&& !is_client_map_match(game_lobby))))
 			{
 				console::error(
 					"Cannot use map from a public, ranked, or joined lobby. Leave it and start an online private match.\n");
@@ -452,7 +463,7 @@ namespace party
 				lua["Lobby"] = lobby;
 			}
 
-			lobby["GetS2xMapGameType"] = []
+			lobby["GetMapSessionGameType"] = []
 			{
 				return get_map_session_gametype();
 			};
@@ -516,13 +527,20 @@ namespace party
 		bool is_valid_gametype(const std::string& gametype)
 		{
 			const auto& mode = game::environment::get_online_mode_info();
+			
 			if (game::environment::is_zombies())
 			{
 				return utils::string::to_lower(gametype) == mode.default_gametype;
 			}
 
-			// The stock helper returns its input pointer when the gametype is absent
-			// from maps/mp/gametypes/_gametypes.txt.
+			// The legacy UI cache truncates refs to 11 characters. Keep its fast
+			// validation for ordinary refs, but consult the same stock definitions
+			// for longer names (notably dogfight_ffa), including client-hosted joins.
+			if (gametype.size() > 11)
+			{
+				return custom_match::is_valid_gametype(gametype);
+			}
+
 			return utils::hook::invoke<const char*>(0x6500E0_g, gametype.data()) != gametype.data();
 		}
 
@@ -1031,26 +1049,39 @@ namespace party
 			start_online_private_map(map_name, gametype, map_index, set_gametype);
 		}
 
-		int get_bot_count()
+		struct client_counts
 		{
-			int count = 0;
-			auto* clients = *game::mp::svs_clients;
+			int clients = 0;
+			int bots = 0;
+		};
 
+		client_counts get_match_client_counts(const int max_clients)
+		{
+			client_counts counts{};
+			const auto* clients = *game::mp::svs_clients;
 			if (!clients)
 			{
-				return 0;
+				return counts;
 			}
 
-			for (int i = 0; i < *game::sv_maxclients; ++i)
+			const auto limit = std::clamp(*game::sv_maxclients, 0, max_clients);
+			for (int i = 0; i < limit; ++i)
 			{
 				const auto& client = clients[i];
-				if (client.state != 0 && (client.remoteAddress.type == game::NA_BOT || client.testClient != 0))
+				// Match the native SV_ConnectionlessPacket getinfo count (0x6DEFCD).
+				if (client.state < 3)
 				{
-					++count;
+					continue;
+				}
+
+				++counts.clients;
+				if (client.testClient != 0)
+				{
+					++counts.bots;
 				}
 			}
 
-			return count;
+			return counts;
 		}
 
 		bool get_custom_lobby_connect_info(dedicated_party::connect_info& info)
@@ -1101,9 +1132,15 @@ namespace party
 				&& info.max_members <= game::environment::get_online_mode_info().max_players;
 		}
 
-		void send_info_response(const game::netadr_s& from, const std::string_view& data, const std::string& response_command)
+		void send_info_response(const game::netadr_s& from, std::string_view data, const std::string& response_command)
 		{
-			if (data.empty() || data.size() > 128)
+			// The challenge is optional: rcon tools such as IW4MAdmin send a bare "s2x_getInfo\0".
+			while (!data.empty() && data.back() == '\0')
+			{
+				data.remove_suffix(1);
+			}
+
+			if (data.size() > 128)
 			{
 				return;
 			}
@@ -1113,13 +1150,12 @@ namespace party
 			auto mapname = get_current_mapname();
 			auto gametype = get_current_gametype();
 			const auto hostname = get_current_hostname();
-			auto clients = get_connected_client_count();
-			auto bots = get_bot_count();
 			const auto& mode = game::environment::get_online_mode_info();
 			auto max_clients = *game::sv_maxclients > 0
 				? std::min(*game::sv_maxclients, mode.max_players)
 				: mode.max_players;
-			auto match_running = game::is_server_running();
+			const auto gameplay_running = game::is_server_running();
+			auto match_running = gameplay_running;
 
 			dedicated_party::connect_info party_connect_info{};
 			const auto has_dedicated_session = dedicated_party::get_connect_info(party_connect_info);
@@ -1131,24 +1167,33 @@ namespace party
 				mapname = party_connect_info.map_name;
 				gametype = party_connect_info.gametype;
 				max_clients = party_connect_info.max_members;
-				clients = std::clamp(party_connect_info.member_count, 0, max_clients);
-				bots = std::clamp(bots, 0, clients);
 				match_running = party_connect_info.match_running;
-				if (has_custom_session && !match_running)
-				{
-					bots = 0; // Frontend actors are not match bots/party members.
-				}
 			}
 
-			info.set("challenge", std::string{ data });
+			client_counts counts{};
+			if (gameplay_running)
+			{
+				// Party membership omits match bots. Count both from the gameplay slots.
+				counts = get_match_client_counts(max_clients);
+			}
+			else if (has_party_session)
+			{
+				// Frontend actors and old map slots are not current match players.
+				counts.clients = std::clamp(party_connect_info.member_count, 0, max_clients);
+			}
+
+			if (!data.empty())
+			{
+				info.set("challenge", std::string{ data });
+			}
 			info.set("gamename", "S2");
 			info.set("mode", std::string{ mode.token });
 			info.set("hostname", hostname);
 			info.set("sv_hostname", hostname);
 			info.set("mapname", mapname);
 			info.set("gametype", gametype);
-			info.set("clients", std::to_string(clients));
-			info.set("bots", std::to_string(bots));
+			info.set("clients", std::to_string(counts.clients));
+			info.set("bots", std::to_string(counts.bots));
 			info.set("sv_maxclients", std::to_string(max_clients));
 			info.set("sv_running", match_running ? "1" : "0");
 			info.set("protocol", std::to_string(PROTOCOL));
@@ -1383,6 +1428,16 @@ namespace party
 					utils::hook::call(0x546128_g, has_assigned_team_stub);
 					utils::hook::call(0x546194_g, update_session_team_stub);
 				}
+			}
+
+			if (game::environment::is_zombies())
+			{
+				// Restriction index 3 is the Zombies-wave limit. Bypass its two
+				// readers for both listen and dedicated hosts: PartyHost admission
+				// emits pa_joinfailed 49 (XBOXLIVE_CANTJOINSESSION_ZOMBIES_WAVE),
+				// while the session update also marks the lobby unjoinable.
+				utils::hook::call(0x486AD6_g, party_join_is_blocked_by_zombies_wave_stub);
+				utils::hook::call(0x29BAC6_g, party_join_is_blocked_by_zombies_wave_stub);
 			}
 
 			cl_connect_hook.create(game::CL_Connect, cl_connect_stub);

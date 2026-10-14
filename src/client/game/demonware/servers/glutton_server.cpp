@@ -3,12 +3,12 @@
 
 #include "glutton_server.hpp"
 
-#include "../achievement_response.hpp"
-#include "../achievement_store.hpp"
+#include "../achievement/response.hpp"
+#include "../achievement/store.hpp"
 
 #include "component/console/console.hpp"
 
-#include "steam/steam.hpp"
+#include "game/demonware/runtime_context.hpp"
 
 namespace demonware
 {
@@ -39,7 +39,7 @@ namespace demonware
 		request.Parse(http_request.body.data(), http_request.body.size());
 		if (request.HasParseError() || !request.IsObject())
 		{
-			console::error("[DW]: [glutton]: received an invalid request.\n");
+			console::error("[DW] glutton: received an invalid request\n");
 			return;
 		}
 
@@ -93,7 +93,12 @@ namespace demonware
 
 				if (!added_user)
 				{
-					const auto user_id = std::to_string(steam::SteamUser()->GetSteamID().bits);
+					const auto identity = runtime_context::get_snapshot();
+					if (!identity)
+					{
+						return;
+					}
+					const auto user_id = std::to_string(identity->user_id);
 					add_user_achievements(users, user_id, achievements, allocator);
 				}
 
@@ -106,12 +111,12 @@ namespace demonware
 			}
 
 			response.AddMember("NextPageToken", "", allocator);
-			console::demonware("[DW]: [glutton]: returned %zu user achievements.\n",
+			console::demonware("[DW] glutton: returned %zu user achievements\n",
 				achievements.size());
 		}
 		else
 		{
-			console::demonware("[DW]: [glutton]: unhandled action '%s'.\n", action);
+			console::demonware("[DW] glutton: unhandled action '%s'\n", action);
 		}
 
 		send_json(response);
